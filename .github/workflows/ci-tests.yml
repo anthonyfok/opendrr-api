@@ -1,0 +1,226 @@
+name: CI tests
+
+# Reference: https://docs.github.com/en/actions/guides/creating-postgresql-service-containers
+# jq, time, and aws are preinstalled in GitHub's ubuntu-20.04 runner
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  #schedule:
+  #  - cron: '38 2 */3 * *'
+  workflow_dispatch:
+
+jobs:
+  CI-tests-on-Ubuntu-runner:
+    runs-on: ubuntu-20.04
+    if: "!contains(github.event.head_commit.message, '[ci skip]') && !contains(github.event.head_commit.message, '[skip ci]')"
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: password
+      DB_NAME: opendrr
+      TIME_RUN: /usr/bin/time stdbuf -oL
+      TZ: America/Vancouver
+
+    # See https://docs.github.com/en/actions/guides/creating-postgresql-service-containers
+    services:
+      postgis:
+        image: postgis/postgis
+        env:
+          POSTGRES_PASSWORD: password
+        ports:
+          - 5432:5432
+        # Set health checks to wait until postgres has started
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Free up disk space by deleting unused software
+        if: ${{ github.event_name != 'schedule' }}
+        run: |
+          df -h
+          $TIME_RUN sudo eatmydata rm -rf /usr/share/dotnet       # 24.1 GB
+          $TIME_RUN sudo eatmydata rm -rf /usr/local/lib/android  # 11.3 GB
+          $TIME_RUN sudo eatmydata rm -rf /opt/ghc                #  1.8 GB
+          $TIME_RUN sudo eatmydata rm -rf /usr/share/swift        #  1.3 GB
+          $TIME_RUN sudo eatmydata rm -rf /usr/local/graalvm      #  1.0 GB
+          df -h
+
+      - name: Checkout OpenDRR/opendrr-api
+        uses: actions/checkout@v2
+
+      - name: Run psql to set up opendrr database
+        if: ${{ github.event_name != 'schedule' }}
+        run: |
+          set -x
+          # Read variables
+          set -a && source sample.env && set +a
+          export POSTGRES_HOST=localhost
+          # for psql
+          #export PGHOST="$POSTGRES_HOST"
+          #export PGPORT="$POSTGRES_PORT"
+          #export PGUSER="$POSTGRES_USER"
+          #export PGPASSWORD="$POSTGRES_PASS"
+
+          # Set up database according to postgis/create_db.sh          
+          type -a psql
+          ls -l $(which psql)
+          psql --version
+          psql -c "CREATE DATABASE ${DB_NAME} OWNER ${POSTGRES_USER};"
+          psql -d "$DB_NAME" -a -U"$POSTGRES_USER" -f postgis/schema.sql
+
+      - name: Install required Python 3 libraries
+        run: |
+          sudo eatmydata apt-get update
+          sudo eatmydata apt-get install python3-elasticsearch python3-numpy python3-pandas python3-psycopg2 python3-sqlalchemy
+          eatmydata pip3 install --user jenkspy
+
+      - name: Set up python/config.ini
+        if: ${{ github.event_name != 'schedule' }}
+        env:
+          MY_PAT: ${{ secrets.MY_PAT }}
+        run: |
+          cat <<EOF > python/config.ini
+          [auth]
+          github_token = $MY_PAT
+
+          [rds]
+          # PostGIS Connection Details
+          postgres_host = localhost
+          postgres_port = 5432
+          postgres_un = postgres
+          postgres_pw = password
+          postgres_db = opendrr
+          postgres_address = localhost:5432/opendrr
+
+          [es]
+          # Elasticsearch Connection Details
+          es_un = elastic
+          es_pw = changeme
+          es_endpoint = elasticsearch-opendrr:9200
+          kibana_endpoint = localhost:5601
+          EOF
+          chmod 600 python/config.ini
+
+      - name: Remove the "wait" at the end of python/add_data.sh
+        run: |
+          sed -i '/tail -f \/dev\/null & wait/d' python/add_data.sh
+
+      - name: Dry-run add_data.sh and see if it completes.
+        if: ${{ github.event_name != 'schedule' }}
+        run: |
+          set -x
+          sudo rm -rf /usr/src/app
+          sudo mkdir /usr/src/app
+          sudo chown $(id -un):$(id -gn) /usr/src/app
+          cp -a python/* /usr/src/app
+
+          set -a && source sample.env && set +a
+          # Override sample variables
+          export POSTGRES_HOST=localhost
+          export ADD_DATA_DRY_RUN=true
+
+          cd /usr/src/app
+          stdbuf -oL ./add_data.sh
+
+      - name: Run add_data.sh and see how far it goes?
+        if: ${{ github.event_name != 'schedule' }}
+        run: |
+          set -x
+          sudo rm -rf /usr/src/app
+          sudo mkdir /usr/src/app
+          sudo chown $(id -un):$(id -gn) /usr/src/app
+          cp -a python/* /usr/src/app
+
+          set -a && source sample.env && set +a
+          # Override sample variables
+          export POSTGRES_HOST=localhost
+
+          cd /usr/src/app
+          stdbuf -oL ./add_data.sh
+
+########################################################################
+
+  CI-tests-with-Docker-Compose:
+    runs-on: ubuntu-20.04
+    if: "!contains(github.event.head_commit.message, '[ci skip]') && !contains(github.event.head_commit.message, '[skip ci]')"
+    env:
+      DOCKER_BUILDKIT: 1
+      TIME_RUN: /usr/bin/time stdbuf -oL
+      TZ: America/Vancouver
+
+    steps:
+      - name: Free up disk space by deleting unused software
+        if: ${{ github.event_name != 'schedule' }}
+        run: |
+          df -h
+          $TIME_RUN sudo eatmydata rm -rf /usr/share/dotnet       # 24.1 GB
+          $TIME_RUN sudo eatmydata rm -rf /usr/local/lib/android  # 11.3 GB
+          $TIME_RUN sudo eatmydata rm -rf /opt/ghc                #  1.8 GB
+          $TIME_RUN sudo eatmydata rm -rf /usr/share/swift        #  1.3 GB
+          $TIME_RUN sudo eatmydata rm -rf /usr/local/graalvm      #  1.0 GB
+          df -h
+
+      - name: Checkout OpenDRR/opendrr-api
+        uses: actions/checkout@v2
+
+      - name: Remove the "wait" at the end of python/add_data.sh
+        run: |
+          sed -i '/tail -f \/dev\/null & wait/d' python/add_data.sh
+
+      - name: Set up .env and python/config.ini
+        if: ${{ github.event_name != 'schedule' }}
+        env:
+          MY_PAT: ${{ secrets.MY_PAT }}
+        run: |
+          cp sample.env .env
+          cat <<EOF > python/config.ini
+          [auth]
+          github_token = $MY_PAT
+
+          [rds]
+          # PostGIS Connection Details
+          postgres_host = db-opendrr
+          postgres_port = 5432
+          postgres_un = postgres
+          postgres_pw = password
+          postgres_db = opendrr
+          postgres_address = db-opendrr:5432/opendrr
+
+          [es]
+          # Elasticsearch Connection Details
+          es_un = elastic
+          es_pw = changeme
+          es_endpoint = elasticsearch-opendrr:9200
+          kibana_endpoint = localhost:5601
+          EOF
+          chmod 600 python/config.ini
+
+      - name: Install Docker Compose V2
+        run: |
+          mkdir -p ~/.docker/cli-plugins
+          ls -ld ~/.docker
+          ls -l ~/.docker
+          version=$(curl -s "https://api.github.com/repos/docker/compose-cli/tags" | jq -r '.[0].name')
+          echo "Fetching Docker Compose $version"
+          download_url=$(curl -s "https://api.github.com/repos/docker/compose-cli/releases/tags/$version" | jq -r '.assets[] | select (.name | endswith("linux-amd64")).browser_download_url')
+          curl -L -o ~/.docker/cli-plugins/docker-compose "$download_url"
+          ls -l ~/.docker/cli-plugins
+          chmod +x ~/.docker/cli-plugins/docker-compose
+          ls -l ~/.docker/cli-plugins
+          docker compose version
+
+      - name: Dry-run and tear down
+        run: |
+          ADD_DATA_DRY_RUN=true docker compose --profile elasticsearch up --build
+          docker compose down -v
+
+      - name: Run "docker compose up" for real; see how far we get?
+        run: |
+          DOCKER_BUILDKIT=1 docker compose --profile elasticsearch up --build
